@@ -1,0 +1,362 @@
+
+Google Bug Hunters
+1
+PROFILE
+showValues
+
+Akira Patafio
+United States
+Joined  March 2026
+-
+Leaderboard rank
+0
+Public reports
+0
+Awards
+Reports
+Awards
+2
+REPORTS
+showValues
+My reports
+
+
+
+Search
+Status
+All
+Program
+All
+REPORT IMAGE	
+REPORT NAME
+STATUS
+PROGRAM
+SUBMITTED
+LINK
+
+REPORTER
+Out-of-bounds reads in /system/bin/blkid NTFS and exFAT probes, reachable from an attacker-supplied microSD or USB device via vold	CLOSED	Android	Sep 17, 2026	
+
+REPORTER
+Unprivileged Android app can abort the Identity Credential HAL with an 11-byte binder payload: unbounded reserve() in libcppbor throws std::bad_alloc, and AOSP builds -fno-exceptions.	CLOSED	Android	Sep 16, 2026	
+Items per page:
+6
+1 – 2 of 2
+Google
+Privacy
+Terms
+Code of Conduct
+About Google
+Google Products
+Feedback
+Help
+CLOSED SEP 18, 2026
+
+Out-of-bounds reads in /system/bin/blkid NTFS and exFAT probes, reachable from an attacker-supplied microSD or USB device via vold
+Android - 562905808
+
+
+Comments
+Report
+Your Report
+
+Report description
+
+Out-of-bounds reads in /system/bin/blkid NTFS and exFAT probes, reachable from an attacker-supplied microSD or USB device via vold
+
+Bug location
+
+Where do you want to report your vulnerability?
+
+Android & Devices VRP – Report security issues affecting Pixel, Smart Home, Google Nest, Home APIs, Pixel Watch, and Fitbit devices and their latest operating systems. See program rules
+
+The problem
+
+Please describe the technical details of the vulnerability
+
+Summary
+Four out-of-bounds reads in the NTFS and exFAT probes of lib/blkid, the library behind the blkid binary AOSP ships as /system/bin/blkid. All four are driven by header fields taken directly from the volume, none of which is validated before use. Two of them copy the out-of-bounds bytes into the volume LABEL that blkid prints.
+
+vold runs this binary on removable media before any fsck and before any mount, in a dedicated u:r:blkid_untrusted:s0 domain. The input is therefore a microSD card or USB-OTG device that an attacker supplies physically.
+
+Affected: external/e2fsprogs lib/blkid/probe.c, AOSP android17-release (3eb1724). The same lines are byte-identical in upstream e2fsprogs master (1.47.4).
+
+Please read the "What I am not claiming" section before assigning severity. I am rating this Low myself.
+
+The four sites
+A — probe.c:709 shift with an attacker-controlled exponent → OOB read at probe.c:726
+
+if (ns->cluster_per_mft_record < 0)
+        mft_record_size = 1 << (0-ns->cluster_per_mft_record);   /* :709 */
+...
+buf_mft = get_buffer(probe, off, mft_record_size);               /* :722 */
+if (!buf_mft)
+        return 1;
+if (memcmp(buf_mft, "FILE", 4))                                  /* :726 */
+cluster_per_mft_record is a signed byte read from the boot sector. A negative value makes the shift exponent up to 128, which is undefined behaviour; in practice mft_record_size comes out smaller than 4. get_buffer() then allocates exactly that many bytes and the memcmp() at :726 reads 4, past the end of the allocation.
+
+UBSan reports the shift at probe.c:709:23; ASan reports the resulting heap-buffer-overflow READ inside memcmp with probe_ntfs probe.c:726 as frame #2.
+
+B — probe.c:750, attrs_offset used before it is bounds-checked → OOB read at :755
+
+attr_off = blkid_le16(mft->attrs_offset);        /* :750  up to 65535, from the image */
+...
+while (1) {
+        attr = (struct file_attribute *) (buf_mft + attr_off);   /* :754 */
+        attr_len  = blkid_le16(attr->len);                       /* :755  <-- reads here */
+        attr_type = blkid_le32(attr->type);
+        val_off   = blkid_le16(attr->value_offset);
+        val_len   = blkid_le32(attr->value_len);
+
+        attr_off += attr_len;
+
+        if ((attr_off > mft_record_size) ||                      /* :762  too late */
+            (attr_len == 0))
+                break;
+The only bounds test on attr_off is at :762, after :755 has already dereferenced the pointer built from it. attrs_offset is a 16-bit field from the volume, so the first read can land up to 64 KiB past the MFT record buffer.
+
+C — probe.c:757, value_offset never validated → OOB read at :774-777, into the label
+
+val_off = blkid_le16(attr->value_offset);        /* :757  from the image, unchecked */
+...
+if (attr_type == MFT_RECORD_ATTR_VOLUME_NAME) {
+        if (val_len > sizeof(label_str))
+                val_len = sizeof(label_str)-1;   /* only the LENGTH is clamped */
+
+        for (i=0, cp=label_str; i < val_len; i+=2,cp++) {
+                val = ((__u8 *) attr) + val_off + i;   /* :774  offset never clamped */
+                *cp = val[0];                          /* :775  read */
+                if (val[1])                            /* :776  read */
+                        *cp = '?';
+        }
+val_len is clamped; val_off is not. The bytes read at :775 are written into label_str[129], which probe.c:785-786 publishes as the LABEL tag. This is the one that turns an out-of-bounds read into something a caller can observe.
+
+E — probe.c:1523, exFAT label->length never validated
+
+unsigned char utf8_label[128];
+unicode_16le_to_utf8(utf8_label, sizeof(utf8_label),
+                     label->name, label->length * 2);   /* :1523 */
+label->length is a byte from a 32-byte directory entry. The exFAT specification caps a volume label at 11 characters, but nothing here enforces it, so length * 2 can reach 510 bytes read from a name field that sits near the end of the superblock buffer. The decoded result becomes the LABEL tag at :1524.
+
+Reproduction
+vold_mirror.c in the attached archive reproduces vold's exact invocation (blkid -c /dev/null -s TYPE -s UUID -s LABEL <path>), so nothing here reaches the library through a path the platform does not use.
+
+./build_and_run.sh          # cross-compile for arm64 and run on an attached device
+./build_and_run.sh host     # build and run on the host instead
+Input	Result
+ntfs_poc.bin	UBSan probe.c:709:23, then ASan heap-buffer-overflow READ at probe_ntfs probe.c:726
+attrs_off_65535.bin	ASan heap-buffer-overflow READ of size 4 at probe_ntfs probe.c:755
+ntfs_leak_poc.bin	ASan heap-buffer-overflow READ of size 1 at probe_ntfs probe.c:775 and :776
+exfat_label_edge.bin	ASan heap-buffer-overflow READ of size 1 at probe_exfat probe.c:1523
+exfat_clean.bin	control — well-formed exFAT, prints LABEL="MYSD" UUID="1234-5678" TYPE="exfat", no ASan error
+Verified twice, on deliberately different toolchains: NDK 27 / clang 18 / aarch64 on a physical Android 15 handset, and Apple clang 17 / x86_64 / macOS. Same four sites both times.
+
+Reachability
+attacker-supplied microSD or USB-OTG device
+  -> vold, system/vold/Utils.cpp: kBlkidPath = "/system/bin/blkid"
+     ForkExecvp(cmd, &output, sBlkidUntrustedContext)   // u:r:blkid_untrusted:s0
+  -> blkid_get_dev(cache, path, BLKID_DEV_NORMAL)
+  -> blkid_verify()  probe.c:1752
+  -> probe_ntfs() / probe_exfat()
+This runs before any fsck and before any mount, which is the point of blkid — it is the code that decides what the volume is. No user interaction beyond inserting the card.
+
+What I am not claiming, and one thing you should know
+Not claimed: no write primitive, no control-flow influence, no code execution, no crash in a production -O2 build, and no byte of memory that I demonstrated reaching a user. In unsanitized builds these inputs are benign — the probe either fails or emits an in-bounds label. I rate this Low and I do not expect it to clear the functional-PoC bar. I am filing it because the fix has to land in AOSP.
+
+Reproduction hardware: a Motorola Moto G Power 5G (2024), Android 15, patch level 2024-11-01 — not one of the program's supported hardware targets. The finding is in AOSP source, not in device-specific code, and I reproduced it a second time on a completely different architecture and compiler to show it is not device-specific. I am happy to re-reproduce on Cuttlefish or a current Pixel if that is required.
+
+Prior art you should weigh: util-linux maintains a fork of this same libblkid code and fixed the equivalent unvalidated-offset reads in 2022. e2fsprogs did not take those fixes, and AOSP vendors e2fsprogs. So the class is publicly known from the util-linux side, while this specific e2fsprogs/AOSP instance appears unreported — I found no CVE, no AOSP bug, and no Gerrit change for it. I am flagging this rather than letting you discover it.
+
+Not part of this report
+Building this library with UBSan also produces eight member access within null pointer reports (tag.c:76, tag.c:114, devname.c:97, save.c:51, save.c:132, cache.c:130, cache.c:137, dev.c:45). These are not bugs. They are the container_of / list_entry offsetof idiom at lib/blkid/list.h:156, which computes an address through a null pointer and never loads from it. The exfat_clean.bin control fires all eight while producing entirely correct output. They should not be patched, and I mention them only so they are not mistaken for part of this report.
+
+Impact analysis
+
+Attacker model
+An attacker who can get a storage device into the phone — a microSD card, or anything over USB-OTG. No app installed, no permissions, no user interaction beyond inserting the media. This is the "hostile removable media" model, and blkid is the first Android code to read the volume: vold runs it before fsck and before mount, precisely because nothing about the volume is trusted yet. Android acknowledges that by giving it its own SELinux domain, u:r:blkid_untrusted:s0.
+
+What the four defects give the attacker
+All four are reads, at offsets the attacker chooses through unvalidated 8- and 16-bit header fields. There is no write primitive and no influence over control flow.
+
+Two of them (C and E) are more than a memory-safety abstraction, because the bytes they read are not discarded — they are decoded into the volume LABEL that blkid prints and vold consumes:
+
+C, probe.c:774-777: value_offset is unvalidated while value_len is clamped, so the copy loop walks from an attacker-chosen offset into label_str[129].
+E, probe.c:1523: label->length * 2 can request up to 510 bytes from a name field near the end of the superblock buffer.
+So the shape of the worst case is information disclosure: heap bytes adjacent to the probe buffer surfaced through a user-visible volume label. That is the honest upper bound on impact, and it is why I filed rather than only patching.
+
+Why I am still rating this Low
+I did not demonstrate the upper bound, and I will not imply that I did:
+
+In unsanitized -O2 builds the PoCs are benign. Nothing segfaulted in any run. Class A simply fails the probe; class E emits an in-bounds label; I never observed a byte of adjacent heap actually surfacing in output.
+The reads are bounded in practice by what the allocator has placed after the probe buffer, which the attacker does not control and I did not attempt to groom.
+blkid is a short-lived forked process in a restricted domain with no network access and no persistent state. A read fault would be a failed volume probe, not a device compromise.
+There is no write primitive, so this does not chain into anything on its own.
+The realistic outcomes are a failed mount of a hostile card, or a small, unreliable leak of adjacent heap into a string the platform then displays. Neither is a user-facing compromise.
+
+Why it is still worth fixing
+The defects sit on the one path Android has explicitly designated as untrusted, in code that runs before every other check. They are four missing bounds tests on fields the format already tells you the valid range of. The equivalent fixes already exist in the util-linux fork of this same code and have since 2022; AOSP is carrying the unfixed copy.
+
+The patch is small and local: validate attrs_offset and value_offset against mft_record_size before dereferencing, bound cluster_per_mft_record before the shift, and clamp label->length to the 11 characters exFAT permits.
+
+The cause
+
+Please specify the steps to reproduce the issue, including sample code where appropriate. Please be as detailed as possible.
+
+The reproducer calls blkid exactly the way vold does, so nothing below reaches the library through a path the platform does not use. system/vold/Utils.cpp:662-674 builds:
+
+blkid -c /dev/null -s TYPE -s UUID -s LABEL <path>
+and runs it through ForkExecvp(cmd, &output, sBlkidUntrustedContext), i.e. in u:r:blkid_untrusted:s0. vold_mirror.c in the attached archive is that call and nothing else — 18 lines.
+
+Option A — build inside an AOSP tree (recommended; uses AOSP's own libext2_blkid)
+The archive ships an Android.bp. Drop the directory into a tree at external/blkid_poc/ and build:
+
+m blkid_probe_poc
+adb push $ANDROID_PRODUCT_OUT/system/bin/blkid_probe_poc /data/local/tmp/
+adb push *.bin /data/local/tmp/
+adb shell 'cd /data/local/tmp && ASAN_OPTIONS=halt_on_error=0:detect_leaks=0 \
+    UBSAN_OPTIONS=halt_on_error=0:print_stacktrace=1 ./blkid_probe_poc ntfs_poc.bin'
+blkid_probe_poc links libext2_blkid, which is AOSP's own module for external/e2fsprogs/lib/blkid — the same code that ships as /system/bin/blkid. The module is built with ASan+UBSan in recover mode, because the defect is an out-of-bounds READ: without a sanitizer these inputs are benign and nothing visible happens.
+
+For the HWASan variant (arm64 only):
+
+SANITIZE_TARGET=hwaddress m blkid_probe_poc_hwasan
+Option B — standalone, no AOSP tree needed
+The archive also builds directly from the e2fsprogs sources with the NDK:
+
+./build_and_run.sh          # cross-compile arm64, push to an attached device, run all inputs
+./build_and_run.sh host     # build and run on the host instead
+./build_hwasan.sh           # HWASan build (needs API >= 34 and -static-libsan)
+./symbolize.sh <input.bin>  # run on device and symbolize the frames locally
+Inputs, and what each one shows
+Input	Expected result
+ntfs_poc.bin	UBSan probe.c:709:23 shift exponent 128, then ASan heap-buffer-overflow READ at probe_ntfs probe.c:726
+attrs_off_65535.bin	ASan/HWASan heap-buffer-overflow READ of size 4 at probe_ntfs probe.c:755
+ntfs_leak_poc.bin	ASan/HWASan heap-buffer-overflow READ of size 1 at probe_ntfs probe.c:775 and :776
+exfat_label_edge.bin	ASan/HWASan heap-buffer-overflow READ of size 1 at probe_exfat probe.c:1523
+exfat_clean.bin	CONTROL. Well-formed exFAT. Prints LABEL="MYSD" UUID="1234-5678" TYPE="exfat" and produces NO sanitizer error.
+Please run the control. Building this library with UBSan also emits eight member access within null pointer reports (tag.c:76, tag.c:114, devname.c:97, save.c:51, save.c:132, cache.c:130, cache.c:137, dev.c:45). Those are the container_of/list_entry offsetof idiom at lib/blkid/list.h:156 — they compute an address through a null pointer and never load from it. exfat_clean.bin fires all eight while returning entirely correct output, which is why they are not part of this report and should not be patched.
+
+How to reproduce on real removable media instead of a file
+blkid_verify() does not require a block device — it open()s the path and lseek/reads it, so a regular file is a faithful stand-in. To exercise the genuine vold path:
+
+dd if=ntfs_poc.bin of=/dev/<sdcard-block-device>
+# reinsert the card; vold runs /system/bin/blkid on it before any fsck or mount
+I did not perform this step, because it needs a sanitizer-instrumented /system/bin/blkid on a userdebug build; the file-backed reproduction above exercises identical code with identical arguments.
+
+Environment used
+Build fingerprint: motorola/cancunn_g_sys/cancunn:15/V1UD35H.26-14-2/c6d50-48b1c:user/release-keys
+Kernel: Linux version 5.10.218-android12-9-00025-g7e8d2909ab18-ab12292143
+Toolchain: NDK 27.0.12077973 / clang 18, aarch64-linux-android30 (ASan) and aarch64-linux-android35 -static-libsan (HWASan)
+Sources: AOSP external/e2fsprogs at android17-release (3eb1724)
+Independently re-verified on Apple clang 17.0.0 / x86_64 / macOS — a different compiler, architecture and operating system produce the same four sites.
+Specify the build fingerprint from the device used to reproduce the issue. The issue should reproduce on a recent build (within the last 30 days).
+
+motorola/cancunn_g_sys/cancunn:15/V1UD35H.26-14-2/c6d50-48b1c:user/release-keys Kernel (adb shell cat /proc/version): Linux version 5.10.218-android12-9-00025-g7e8d2909ab18-ab12292143 (build-user@build-host) (Android (7284624, based on r416183b) clang version 12.0.5, LLD 12.0.5) #1 SMP PREEMPT Thu Aug 29 00:56:09 UTC 2024 Android 15, build V1UD35H.26-14-2, security patch level 2024-11-01. I have to flag this field rather than let you discover it: this is NOT a build from within the last 30 days, and a Motorola handset is not one of the program's supported hardware targets. I do not own an eligible device. What I can offer instead: - The defect is in AOSP source, not device-specific code. I verified the affected lines are present and unchanged at external/e2fsprogs android17-release (3eb1724), which is the current shipping branch, and identical in upstream e2fsprogs master (1.47.4). - I reproduced it a second time on a completely different architecture, compiler and OS (x86_64 / Apple clang 17 / macOS) specifically to demonstrate it is not a property of this device or this build. - The attached Android.bp builds the reproducer against AOSP's own libext2_blkid, so it can be built and run on any current build, including Cuttlefish, in a few minutes. If a reproduction on a current Pixel or Cuttlefish build is required for triage, tell me and I will produce one.
+
+Provide crash artifacts including stack trace (if available).
+
+All traces below are from the attached PoCs. The frames were symbolized against the local copy of the same binary (the pushed binary carries no symbols).
+
+A — probe.c:709 shift, then out-of-bounds read at probe.c:726
+Host build (Apple clang 17, x86_64), which gives the fully symbolized chain:
+
+probe.c:709:23: runtime error: shift exponent 128 is too large for 32-bit type 'int'
+SUMMARY: UndefinedBehaviorSanitizer: undefined-behavior probe.c:709:23
+
+==66939==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x6020000000f1
+READ of size 4
+    #0 MemcmpInterceptorCommon(...)
+    #1 memcmp
+    #2 0x00010300d960 in probe_ntfs probe.c:726
+    #3 0x00010300c21b in blkid_verify probe.c:1752
+    #4 0x000103006bdf in blkid_get_dev devname.c:85
+    #5 0x0001030049b0 in main vold_mirror.c:8
+mft_record_size comes out of the undefined shift smaller than 4, get_buffer() allocates exactly that, and the memcmp(buf_mft, "FILE", 4) at :726 reads 4.
+
+B — probe.c:755, attrs_offset dereferenced before it is bounds-checked
+Device, arm64, Android 15 (ASan):
+
+ERROR: AddressSanitizer: heap-buffer-overflow on address 0x006d08f40083
+READ of size 4 at 0x006d08f40083 thread T0
+    #0 in probe_ntfs probe.c:755
+Host build, same input, fully symbolized:
+
+    #0 0x00010bc2cff6 in probe_ntfs probe.c:755
+    #1 in blkid_verify probe.c:1752
+    #2 in blkid_get_dev devname.c:85
+    #3 in main vold_mirror.c:8
+C — probe.c:775/:776, value_offset never validated, bytes land in the LABEL
+Host build:
+
+ERROR: AddressSanitizer: heap-buffer-overflow on address 0x61900000ffb8
+READ of size 1
+    #0 0x00010a0a4dfd in probe_ntfs probe.c:775
+ERROR: AddressSanitizer: heap-buffer-overflow on address 0x61900000ffb9
+READ of size 1
+    #0 0x00010a0a4ee6 in probe_ntfs probe.c:776
+E — probe.c:1523, exFAT label->length unvalidated
+Host build:
+
+ERROR: AddressSanitizer: heap-buffer-overflow on address 0x631000011801
+READ of size 1
+    #0 0x000106b00459 in probe_exfat probe.c:1523
+LABEL="䅁䅁䅁䅁䅁䅁䅁䅁䅁䅁䅁䅁䅁䅁䅁" UUID="4433-2211" TYPE="exfat"
+The LABEL line is printed by the same run: the decoded result of the over-long read is what blkid emits and vold consumes.
+
+Control — exfat_clean.bin
+LABEL="MYSD" UUID="1234-5678" TYPE="exfat"
+No AddressSanitizer error. A well-formed exFAT superblock through the identical code path.
+
+HWASan output (if available)
+
+HWASan build: NDK 27 / clang 18, --target=aarch64-linux-android35, -fsanitize=hwaddress,undefined -fsanitize-recover=hwaddress,undefined -static-libsan, run on the Moto G Power 5G (2024) under Android 15. Frames symbolized locally.
+
+(Note: HWASan needs API >= 34 here — a HWASan binary built at API 30 SIGSEGVs before main() on this device — and -static-libsan is required or the target translation unit comes back uninstrumented.)
+
+attrs_off_65535.bin — probe.c:755
+==26990==ERROR: HWAddressSanitizer: tag-mismatch on address 0x0052716e0003 at pc 0x00607170ddd4
+READ of size 4 at 0x0052716e0003 tags: 10/00 (ptr/mem) in thread T0
+    #0 __hwasan_loadN_noabort
+    #1 0x607174d6c8   probe_ntfs    lib/blkid/probe.c:755:14
+    #2 0x607174b360   blkid_verify  lib/blkid/probe.c:1752:8
+    #3 0x6071744f60   blkid_get_dev lib/blkid/devname.c:85:9
+    #4 0x6071741efc   main          vold_mirror.c:8:19
+
+[0x0052716e0000,0x0052716e0400) is a small unallocated heap chunk; size: 1024 offset: 3
+ntfs_leak_poc.bin — probe.c:775
+==27019==ERROR: HWAddressSanitizer: tag-mismatch on address 0x004e15cbff38 at pc 0x005c15d33820
+READ of size 1 at 0x004e15cbff38 tags: 57/00 (ptr/mem) in thread T0
+    #0 0x5c15d33820   probe_ntfs    lib/blkid/probe.c:775:11
+    #1 0x5c15d31360   blkid_verify  lib/blkid/probe.c:1752:8
+    #2 0x5c15d2af60   blkid_get_dev lib/blkid/devname.c:85:9
+    #3 0x5c15d27efc   main          vold_mirror.c:8:19
+
+[0x004e15cbfc00,0x004e15cc0000) is a small unallocated heap chunk; size: 1024 offset: 824
+SUMMARY: HWAddressSanitizer: tag-mismatch  probe_ntfs lib/blkid/probe.c:775:11
+exfat_label_edge.bin — probe.c:1523
+==27639==ERROR: HWAddressSanitizer: tag-mismatch on address 0x007f2d9a5001 at pc 0x005a0e091280
+READ of size 1 at 0x007f2d9a5001 tags: 07/00 (ptr/mem) in thread T0
+    ... blkid_verify lib/blkid/probe.c:1752:8
+        blkid_get_dev lib/blkid/devname.c:85:9
+        main          vold_mirror.c:8:19
+exfat_clean.bin — control
+LABEL="MYSD" UUID="1234-5678" TYPE="exfat"
+No tag-mismatch.
+
+One honest note on coverage
+ntfs_poc.bin (site A) produces the UBSan shift report under HWASan but NOT a tag-mismatch, where ASan does report a heap-buffer-overflow. HWASan's tag granule is 16 bytes, so a 4-byte read just past a small allocation can land inside the same granule and go unseen. The two sanitizers are complementary here; ASan is the one that catches site A.
+
+Does anyone else know about this vulnerability?
+
+No, this vulnerability is private.
+
+Do you plan to disclose this vulnerability publicly?
+
+No, I am only notifying Google
+
+How would you like to be publicly acknowledged for your report?
+
+Akira Patafio
+
+AF-05-blkid-poc.tar.gz
+AF-05-blkid-poc.tar.gz
